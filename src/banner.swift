@@ -1,6 +1,6 @@
 import Cocoa
 
-// A borderless, click-through HUD that appears in the top-right corner and fades out.
+// A borderless HUD that appears in the top-right corner and fades out.
 //
 // Deliberately NOT a Notification Center post. `osascript -e 'display notification'`
 // runs under Script Editor's identity; if that app has no notification authorization,
@@ -8,34 +8,182 @@ import Cocoa
 // to chase. Drawing our own window removes Notification Center from the path entirely,
 // so no authorization applies and there is no alert-style toggle to configure.
 //
-// usage: banner <message> [duration-seconds] [slot]
+// usage: banner <message> [duration-seconds] [slot] [--focus-iterm2 <session-uuid>]
+//
+// With --focus-iterm2 the banner becomes clickable and a click jumps to the exact
+// iTerm2 tab that produced it. Without it the banner stays click-through, exactly as
+// before, so the default behaviour is unchanged.
 
-let message  = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "Claude Code"
-let duration = CommandLine.arguments.count > 2 ? (Double(CommandLine.arguments[2]) ?? 5.0) : 5.0
+let incoming = Array(CommandLine.arguments.dropFirst())
+
+var positional: [String] = []
+var requestedFocusUUID: String?
+
+var argIndex = 0
+while argIndex < incoming.count {
+    if incoming[argIndex] == "--focus-iterm2", argIndex + 1 < incoming.count {
+        requestedFocusUUID = incoming[argIndex + 1]
+        argIndex += 2
+        continue
+    }
+    positional.append(incoming[argIndex])
+    argIndex += 1
+}
+
+let message  = positional.count > 0 ? positional[0] : "Claude Code"
+let duration = positional.count > 1 ? (Double(positional[1]) ?? 5.0) : 5.0
 // Slot 0 is the top-right corner; each further slot stacks one banner lower, so
 // two sessions finishing at once don't draw on top of each other.
-let slot     = CommandLine.arguments.count > 3 ? (Int(CommandLine.arguments[3]) ?? 0) : 0
+let slot     = positional.count > 2 ? (Int(positional[2]) ?? 0) : 0
+
+// SECURITY: the hook validates this too, but a binary that hands an unchecked string
+// to osascript is one refactor away from an injection. An iTerm2 session id is hex and
+// dashes, so demanding exactly that shape makes a breakout structurally impossible
+// rather than merely escaped. Anything else is dropped and the banner stays passive.
+func isSessionUUID(_ candidate: String) -> Bool {
+    let pattern = "^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+    return candidate.range(of: pattern, options: .regularExpression) != nil
+}
+
+let focusUUID: String? = requestedFocusUUID.flatMap { isSessionUUID($0) ? $0 : nil }
+
+// Selecting a specific tab needs AppleScript, which means Automation consent the first
+// time. Plain app activation does not, so a denied prompt still lands the user in iTerm2
+// — right app, wrong tab — instead of the click doing nothing at all.
+func activateITermWithoutAutomation() {
+    let bundleID = "com.googlecode.iterm2"
+    guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return }
+    NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+}
+
+// The session id is matched against iTerm2's own `id`, not the wNtNpN coordinates in
+// ITERM_SESSION_ID: those are frozen when the session is created and go stale as soon
+// as tabs are reordered or closed.
+func focusITermSession(_ uuid: String) {
+    let script = """
+    on run argv
+      set target to item 1 of argv
+      tell application "iTerm2"
+        activate
+        repeat with w from 1 to (count of windows)
+          repeat with t from 1 to (count of tabs of window w)
+            repeat with s from 1 to (count of sessions of tab t of window w)
+              set sess to session s of tab t of window w
+              if (id of sess) as string is target then
+                select window w
+                select tab t of window w
+                select sess
+                return "ok"
+              end if
+            end repeat
+          end repeat
+        end repeat
+      end tell
+      return "notfound"
+    end run
+    """
+
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    // The uuid travels as an argv element, never spliced into the script text, so the
+    // question of how to escape it never arises.
+    task.arguments = ["-e", script, uuid]
+    task.standardOutput = Pipe()
+    task.standardError = Pipe()
+
+    do {
+        try task.run()
+        task.waitUntilExit()
+        if task.terminationStatus != 0 { activateITermWithoutAutomation() }
+    } catch {
+        activateITermWithoutAutomation()
+    }
+}
+
+// Borrow the installed Claude app's own icon rather than committing a copy of it. Keeps a
+// binary asset out of a compile-from-source repo, avoids shipping someone else's mark, and
+// stays right if that icon ever changes. Falls back to a system symbol so the banner is
+// always identifiable, even where the desktop app was never installed.
+func claudeIcon() -> NSImage? {
+    let workspace = NSWorkspace.shared
+    let bundleIDs = ["com.anthropic.claudefordesktop", "com.anthropic.claude"]
+    for bundleID in bundleIDs {
+        if let url = workspace.urlForApplication(withBundleIdentifier: bundleID) {
+            return workspace.icon(forFile: url.path)
+        }
+    }
+    let config = NSImage.SymbolConfiguration(pointSize: 22, weight: .medium)
+    return NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Claude")?
+        .withSymbolConfiguration(config)
+}
+
+// Borderless windows do not receive clicks until something in the responder chain opts
+// in, and a HUD must not become key just because it was clicked — hence both overrides.
+final class ClickCatcher: NSView {
+    var onClick: (() -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { onClick?() }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)   // no Dock icon, no menu bar takeover
 
-final class Banner {
-    var window: NSWindow!
+// How long to wait on osascript before giving up and exiting anyway. Long enough for
+// someone to read and answer the first-click Automation dialog, short enough that a
+// dialog left untouched cannot keep this process resident.
+let focusTimeoutSeconds: Double = 30
 
-    func show(_ text: String, duration: Double, slot: Int) {
+final class Banner {
+    var window: NSPanel!
+    // Set once a click is being serviced, so the fade timer does not terminate the process
+    // while osascript is still working.
+    private var isFocusing = false
+
+    func show(_ text: String, duration: Double, slot: Int, focusUUID: String?) {
         guard let screen = NSScreen.main else { NSApp.terminate(nil); return }
-        let w: CGFloat = 380, h: CGFloat = 92
+        let w: CGFloat = 380
+
+        // Height follows the text instead of being fixed. Session titles are longer than
+        // folder names and the icon costs width, so a fixed 92 truncated real messages.
+        let iconSize: CGFloat = 28
+        let textX = 18 + iconSize + 12
+        let textW = w - textX - 18
+        let bodyFont = NSFont.systemFont(ofSize: 13)
+        let measured = (text as NSString).boundingRect(
+            with: NSSize(width: textW, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: bodyFont]).height
+        // chromeHeight is the fixed furniture: padding, the title row, and the gap under
+        // it. minHeight keeps short messages looking exactly as they did before.
+        let chromeHeight: CGFloat = 52
+        // maxHeight sets the stacking pitch, so an over-generous value costs usable slots
+        // before a banner runs off-screen. The name is capped at 64 characters, so even a
+        // long custom template lands in three lines; 140 covers that with room and keeps
+        // the pitch far closer to the original 102 than 200 did.
+        let minHeight: CGFloat = 92, maxHeight: CGFloat = 140
+        let bodyH = ceil(measured)
+        let h = min(maxHeight, max(minHeight, chromeHeight + bodyH))
+
         let vf = screen.visibleFrame
-        let y = vf.maxY - h - 16 - CGFloat(slot) * (h + 10)
+        // Stacking pitch uses maxHeight, not this banner's own height: heights now vary
+        // between banners, and pitching on the shorter one would let a tall neighbour
+        // overlap it. Costs a gap under short banners, which beats drawing over them.
+        let y = vf.maxY - h - 16 - CGFloat(slot) * (maxHeight + 10)
         let rect = NSRect(x: vf.maxX - w - 16, y: y, width: w, height: h)
 
-        window = NSWindow(contentRect: rect, styleMask: [.borderless],
-                          backing: .buffered, defer: false)
+        // .nonactivatingPanel matters: without it, clicking the banner activates this
+        // process first, stealing the focus we are about to hand to iTerm2.
+        window = NSPanel(contentRect: rect, styleMask: [.borderless, .nonactivatingPanel],
+                         backing: .buffered, defer: false)
         window.level = .statusBar          // floats above normal windows
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = true
-        window.ignoresMouseEvents = true   // never steals a click
+        // Only intercept clicks when there is somewhere to go. With no focus target the
+        // banner stays click-through, which is the long-standing behaviour.
+        window.ignoresMouseEvents = (focusUUID == nil)
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
 
         let blur = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: w, height: h))
@@ -46,18 +194,60 @@ final class Banner {
         blur.layer?.cornerRadius = 16
         blur.layer?.masksToBounds = true
 
-        let title = NSTextField(labelWithString: "Claude Code")
+        // Icon on the left, text indented past it. Without this the banner announces
+        // itself only in words, which is easy to miss in peripheral vision.
+        if let icon = claudeIcon() {
+            let iconView = NSImageView(frame: NSRect(x: 18, y: (h - iconSize) / 2,
+                                                    width: iconSize, height: iconSize))
+            iconView.image = icon
+            iconView.imageScaling = .scaleProportionallyUpOrDown
+            // Only tints the symbol fallback; a real app icon keeps its own colours.
+            iconView.contentTintColor = .secondaryLabelColor
+            blur.addSubview(iconView)
+        }
+
+        let title = NSTextField(labelWithString:
+            focusUUID == nil ? "Claude Code" : "Claude Code  ·  click to focus")
         title.font = .systemFont(ofSize: 12, weight: .semibold)
         title.textColor = .secondaryLabelColor
-        title.frame = NSRect(x: 18, y: h - 30, width: w - 36, height: 16)
+        title.frame = NSRect(x: textX, y: h - 30, width: textW, height: 16)
 
         let body = NSTextField(wrappingLabelWithString: text)
-        body.font = .systemFont(ofSize: 13)
+        body.font = bodyFont
         body.textColor = .labelColor
-        body.frame = NSRect(x: 18, y: 14, width: w - 36, height: h - 52)
+        body.frame = NSRect(x: textX, y: 14, width: textW, height: h - chromeHeight)
 
         blur.addSubview(title)
         blur.addSubview(body)
+
+        if let uuid = focusUUID {
+            let catcher = ClickCatcher(frame: NSRect(x: 0, y: 0, width: w, height: h))
+            catcher.onClick = { [weak self] in
+                guard let self = self, !self.isFocusing else { return }
+                self.isFocusing = true
+
+                // Acknowledge the click by leaving immediately. osascript can take a long
+                // time — it walks every window, tab and session, and on the very first
+                // click it sits behind the Automation consent dialog until the user
+                // answers. Doing that on the main thread froze the banner mid-fade and
+                // left it on screen indefinitely if consent was ignored, breaking the one
+                // guarantee this window has: that it always goes away.
+                self.window.orderOut(nil)
+
+                DispatchQueue.global(qos: .userInitiated).async {
+                    focusITermSession(uuid)
+                    DispatchQueue.main.async { NSApp.terminate(nil) }
+                }
+
+                // Backstop, so a consent dialog nobody answers cannot leave this process
+                // resident forever. Generous enough to survive a human reading it.
+                DispatchQueue.main.asyncAfter(deadline: .now() + focusTimeoutSeconds) {
+                    NSApp.terminate(nil)
+                }
+            }
+            blur.addSubview(catcher)   // added last so it sits above the labels
+        }
+
         window.contentView = blur
 
         window.alphaValue = 0
@@ -68,6 +258,9 @@ final class Banner {
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+            // A click already in flight owns teardown; fading out from under it would kill
+            // osascript before it had selected anything.
+            if self.isFocusing { return }
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.45
                 self.window.animator().alphaValue = 0
@@ -77,5 +270,5 @@ final class Banner {
 }
 
 let banner = Banner()
-banner.show(message, duration: duration, slot: slot)
+banner.show(message, duration: duration, slot: slot, focusUUID: focusUUID)
 app.run()

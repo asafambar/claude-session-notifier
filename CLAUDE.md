@@ -1,7 +1,8 @@
 # claude-session-notifier — project guide for Claude
 
-A Claude Code `Stop` hook that draws a banner naming the session that just finished,
-so someone running several sessions in parallel knows which one wants them.
+A Claude Code hook that draws a banner naming the session that just finished, or the one
+blocked waiting on you, so someone running several sessions in parallel knows which one
+wants them.
 
 Small on purpose: ~600 lines, MIT, no runtime services. Keep it that way.
 
@@ -9,10 +10,12 @@ Small on purpose: ~600 lines, MIT, no runtime services. Keep it that way.
 
 ```
 install.sh / uninstall.sh / doctor.sh      macOS entry points
+tests/run-tests.sh                         the regression set (CI runs it)
 src/banner.swift                           the HUD window (compiled at install time)
 hooks/claude-session-notifier.sh           the dispatcher: stdin JSON -> name -> banner
+                                           (registered on Stop AND Notification)
 docs/why-osascript-fails.md                why Notification Center is avoided
-.github/workflows.disabled/ci.yml          CI, parked until the token has `workflow` scope
+.github/workflows/ci.yml                   CI: compile, shellcheck, tests
 ```
 
 `main` is macOS-only. Windows lives on the **`windows-support`** branch
@@ -23,14 +26,23 @@ real Windows** — see issue #1. Do not merge it on the strength of CI alone.
 ## The flow
 
 ```
-Claude finishes a turn
-  └─ Stop hook (~/.claude/settings.json, user scope -> every project)
+Claude finishes a turn ── or ── blocks waiting on the user
+  └─ Stop / Notification hook (~/.claude/settings.json, user scope -> every project)
        └─ claude-session-notifier.sh
-            ├─ reads { "cwd": ... } from stdin -> basename -> "oz-A"
-            ├─ afplay Glass.aiff              (needs no permission)
-            └─ claude-banner "oz-A finished" 5 0
-                 └─ borderless NSWindow, .statusBar level, click-through
+            ├─ reads { cwd, transcript_path, hook_event_name } from stdin
+            │    ├─ last "ai-title" in the transcript -> "Fix the retry backoff"
+            │    └─ or basename of cwd                -> "oz-A"
+            ├─ Stop -> "<name> finished"   Notification -> "<name> needs you"
+            │    (idle_prompt notifications are ignored: "you stopped typing")
+            ├─ afplay Glass.aiff / Ping.aiff  (needs no permission)
+            └─ claude-banner "<message>" 5 0 --focus-iterm2 <uuid>
+                 └─ borderless NSPanel, .statusBar level, click -> focus that tab
 ```
+
+Both events are registered because they answer different questions, and a session that
+stops to ask something never fires `Stop` — its turn has not ended. `install.sh` and
+`uninstall.sh` must stay symmetric across both, or an uninstall leaves half of itself
+behind pointing at a deleted script.
 
 ## Invariants — do not break these
 
@@ -50,7 +62,24 @@ Claude finishes a turn
 - **Merge `settings.json`, never overwrite.** Back it up, drop only entries matching the
   `claude-session-notifier` marker, stay idempotent on re-run.
 - **Compile on the user's machine.** A downloaded binary is Gatekeeper-quarantined.
-- **No network calls. No logging of the payload.** `session_id` is never read.
+- **No network calls. Nothing is ever written or logged.** The hook reads `cwd` and, only
+  when `CLAUDE_BANNER_NAME_SOURCE=title` is set (it is off by default), the last `ai-title`
+  entry out of `transcript_path`. Nothing else in the payload is touched — not `session_id`, not
+  `last_assistant_message`. Widening that set is a decision, not a refactor.
+- **`folder` must stay a real escape hatch.** Someone who sets it is asking this hook to
+  read nothing but the path it is handed. Keep that path free of transcript access.
+- **Validate the tab id, and never splice it into script text.** It comes from an
+  environment variable, so hook and binary both check it against hex-and-dashes, and it
+  reaches `osascript` through `argv`. Same discipline as the session name.
+- **No focus target means click-through.** The banner must not start intercepting clicks
+  for people it cannot help.
+- **The banner always goes away.** Nothing on the click path may block the main thread:
+  `osascript` walks every window and, on a first click, waits on the Automation dialog.
+  Do that synchronously and the window freezes on screen forever. Hand off, and keep the
+  timeout backstop.
+- **`Notification` is not all attention.** `idle_prompt` fires after every turn the user
+  walks away from. Skip it by name, and let unknown types through — a missed attention
+  request is worse than an extra banner.
 
 ## Commands
 
@@ -58,7 +87,8 @@ Claude finishes a turn
 ./install.sh --dry-run     # show what would change
 ./install.sh               # compile, install, register, fire a test banner
 ./doctor.sh                # isolate which stage failed
-./uninstall.sh             # remove only our own entry
+./uninstall.sh             # remove only our own entries (both events)
+./tests/run-tests.sh       # regression set; SKIP_SLOW=1 skips the install round trip
 
 ~/.claude/hooks/bin/claude-banner "text" 6 0     # draw directly (message, seconds, slot)
 ```
@@ -73,15 +103,32 @@ Exit code 0 proves nothing here — every historical failure exited 0. Two rules
 2. **Confirm visually.** No automated check can tell whether a window appeared. Draw a
    real banner and ask the user.
 
+`tests/run-tests.sh` implements rule 1 for the whole regression set below; CI runs it.
+It clears every `CLAUDE_BANNER_*` and terminal variable before each case, because an
+inherited `ITERM_SESSION_ID` from the developer's own shell silently changes what the
+hook emits and makes a case pass for the wrong reason.
+
+When adding a test, check it can actually fail: break the line it covers and confirm it
+goes red. Doing that found `title="${title:0:64}"` to be dead — the shared cap below it
+already applied — so the line was removed rather than the test weakened.
+
 Regression set worth re-running after any change to the dispatcher: plain name, name
 with spaces, Hebrew/Japanese/emoji, 90-char name, missing `cwd`, malformed JSON, empty
 stdin, `/`, an injection payload, custom `CLAUDE_BANNER_*` vars, and two banners at once.
+Since the dispatcher became event-aware and title-aware, add: `hook_event_name` of `Stop`
+vs `Notification` vs an unknown value vs absent (all but Notification must read as
+"finished", never fall silent), `NAME_SOURCE=title` with a readable transcript, with a
+missing one (must fall back to the folder, not the generic label), and `NAME_SOURCE=folder`
+never opening the transcript at all. Round-trip `install.sh`/`uninstall.sh` against a
+settings.json holding foreign hooks on both events.
 
 ## Known limitations (documented in the README — keep them honest)
 
-`Stop` fires every turn end, not just on completion · banner slots are never reclaimed ·
-main display only · fixed 380×92 window clips long text · no unit tests · macOS needs
-`jq` · the `osascript` fallback is unreliable by design.
+`Stop` fires every turn end, not just on completion · banner slots are never reclaimed,
+and variable heights mean stacked banners leave gaps · main display only · click-to-focus
+is iTerm2-only and its first click asks for Automation consent · the visual layer is
+untested and untestable · macOS needs `jq` · the `osascript` fallback is unreliable by
+design.
 
 ## Style
 
